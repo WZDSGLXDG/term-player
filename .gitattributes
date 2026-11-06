@@ -1,0 +1,4 @@
+# 仓库内存 LF；Windows 批处理拿到 CRLF 才能正常执行
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf

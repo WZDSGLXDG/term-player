@@ -1,0 +1,15 @@
+# 运行时数据：含真实曲库路径与播放记录，不进仓库
+config.json
+config.json.tmp
+meta-cache.json
+meta-cache.json.tmp
+
+# 打包产物
+dist/
+*.zip
+
+# 系统 / 编辑器
+Thumbs.db
+desktop.ini
+.DS_Store
+*.log
