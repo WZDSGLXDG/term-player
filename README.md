@@ -3,6 +3,8 @@
 零 npm 依赖的终端 TUI 播放器，Windows 本地可用。播放引擎默认 **mpv**（命名管道 JSON IPC，暂停 / seek / 音量 / 倍速全实时），
 没有 mpv 时回退到 `ffplay`；元数据走 `ffprobe`，歌词读本地 `.lrc`。
 
+![term-player 界面截图](docs/screenshot.png)
+
 **歌词视图**（100×24，示例曲库）：
 
 ```
