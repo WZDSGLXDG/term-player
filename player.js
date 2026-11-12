@@ -147,17 +147,41 @@ function resolveLyricDirs(musicDir) {
 function rescan(keepPlaying = true) {
   state.scanning = true;
   state.dirty = true;
+
   const list = scan(opts.dir, { recursive: opts.recursive });
+
+  // 先看文件有没有真的变。改一个 .lrc 也会连带触发这里（歌词目录常放在曲库里面），
+  // 而重建 186 个对象会丢掉已探测的元数据、重算视图、还得把光标位置找回来——全是白干。
+  const prev = state.songs;
+  // prev.length > 0：首扫（state.songs 还空着）必须完整走一遍，别被"没变"挡在门外
+  const same = prev.length > 0 && prev.length === list.length && list.every((f, i) => {
+    const p = prev[i];
+    return p && p.path === f.path && p.size === f.size && Math.abs(p.mtime - f.mtime) < 1;
+  });
+  if (same) {
+    state.scanning = false;
+    return false;
+  }
+
+  // 记住选中行是哪首歌：重建视图后下标会变，靠下标会指到别的歌上
+  const selBefore = state.view[state.sel] ? state.view[state.sel].path : null;
+
   const prevPlaying = keepPlaying ? state.playing : null;
   state.songs = list.map((f, i) => ({ ...f, id: f.path }));
   rebuildDirs();
   applyFilter();
+
+  // 选中位置跟着「那首歌」走，而不是跟着下标走。
+  // 也**不能**拉回正在播放那首——用户可能正翻到很远的地方找歌，一刷新就被拽回来。
+  if (selBefore) {
+    const vi = state.view.findIndex((s) => s.path === selBefore);
+    if (vi >= 0) state.sel = vi;
+  }
+
   if (prevPlaying) {
     const idx = state.songs.findIndex((s) => s.path === prevPlaying.path);
     if (idx >= 0) {
       state.playing = state.songs[idx];
-      const vi = state.view.findIndex((s) => s.path === state.songs[idx].path);
-      if (vi >= 0) state.sel = vi;
     } else {
       state.playing = null;
       state.lrc = null;
@@ -168,6 +192,7 @@ function rescan(keepPlaying = true) {
   state.scanning = false;
   state.dirty = true;
   kickMeta();
+  return true;
 }
 
 // 重新统计分类（文件夹 -> 曲目数），并把 dirFilter 收敛到仍然存在的分类
@@ -204,6 +229,7 @@ function cycleDir(step) {
   i = (i + step + names.length) % names.length;
   state.dirFilter = names[i];
   applyFilter();
+  savePlayState(true);   // 强制写：savePlayState 本身有 10 秒节流，刚启动就切分类会被吞掉
   const cur = state.dirFilter || '全部';
   const n = state.view.length;
   say(`分类：${cur}（${n} 首）`, 1600);
@@ -220,7 +246,8 @@ function kickMeta() {
   if (state.playing && !state.playing.meta) want.unshift(state.playing);
   let added = 0;
   for (const s of want) {
-    if (!s.meta && !s.metaPending) {
+    // 探失败也算「还没到手」，可以再试一次；但别无限重试——坏文件会让 ffprobe 每 0.5 秒起一次
+    if (!s.meta && !s.metaPending && (s.metaFail || 0) < 3) {
       s.metaPending = true;
       metaQueue.push(s);
       added++;
@@ -236,7 +263,10 @@ function pumpMeta() {
     const s = metaQueue.shift();
     metaRunning++;
     probe.probe(FFPROBE, s.path).then((m) => {
-      s.meta = m;
+      // 失败不能往 song.meta 上一挂就走：kickMeta 看的是 !s.meta，
+      // 挂上失败对象等于把这首歌钉死在「读取中…」，之后永不重探（旧注释说的重试根本没发生）。
+      if (m && m.ok) { s.meta = m; s.metaFail = 0; }
+      else { s.meta = null; s.metaFail = (s.metaFail || 0) + 1; }
       s.metaPending = false;
       metaRunning--;
       state.dirty = true;
@@ -245,7 +275,13 @@ function pumpMeta() {
         loadLyricsFor(state.playing);
       }
       pumpMeta();
-    }).catch(() => { s.metaPending = false; metaRunning--; pumpMeta(); });
+    }).catch(() => {
+      s.meta = null;
+      s.metaFail = (s.metaFail || 0) + 1;
+      s.metaPending = false;
+      metaRunning--;
+      pumpMeta();
+    });
   }
 }
 
@@ -258,6 +294,8 @@ function rebuildLyricsIndex() {
 function loadLyricsFor(song) {
   const hit = lyrics.match(song, state.lyricsIndex);
   if (hit) {
+    // 浅拷贝：lines 与索引缓存是同一个数组（省一次拷贝）。这里当只读用，
+    // 谁要在 state.lrc.lines 上就地排序/过滤，先把数组复制一份，否则会污染缓存里所有引用它的歌。
     state.lrc = { ...hit.parsed, file: hit.file, score: hit.score };
     state.lrcIdx = -1;
   } else {
@@ -284,7 +322,10 @@ async function playSong(song, startSec = 0, loadOpts = {}) {
   state.lrcIdx = -1;
   state.dirty = true;
   if (!song.meta) {
-    song.meta = await probe.probe(FFPROBE, song.path);
+    // 同上：探测失败不留在 song.meta 上，否则这首歌永久停在「读取中…」、时长恒为 0
+    const m = await probe.probe(FFPROBE, song.path);
+    if (m && m.ok) { song.meta = m; song.metaFail = 0; }
+    else { song.meta = null; song.metaFail = (song.metaFail || 0) + 1; }
     song.metaPending = false;
   }
   const dur = (song.meta && song.meta.duration) || 0;
@@ -460,7 +501,8 @@ function changeSpeed(dir) {
 function handleSearchKey(buf) {
   if (buf === KEY.enter) { state.inputMode = false; say(`过滤：${state.filter || '（无）'}`, 1200); state.dirty = true; return; }
   if (buf === KEY.esc) { state.inputMode = false; state.filter = ''; applyFilter(); state.dirty = true; return; }
-  if (buf === '\x7f' || buf === '\b') { state.filter = state.filter.slice(0, -1); applyFilter(); state.dirty = true; return; }
+  // 按码点删，不按 UTF-16 码元删：退格切掉半个 emoji 会留下孤立代理对，屏幕上是个方块
+  if (buf === '\x7f' || buf === '\b') { state.filter = [...state.filter].slice(0, -1).join(''); applyFilter(); state.dirty = true; return; }
   if (buf.length === 1 && buf >= ' ') { state.filter += buf; applyFilter(); state.dirty = true; return; }
 }
 
@@ -502,7 +544,7 @@ function handleActionKey(buf) {
     case '[': cycleDir(-1); break;
     case ']': cycleDir(1); break;
     case 'j': state.sel = Math.max(0, Math.min(state.view.length - 1, state.sel + 1)); state.dirty = true; break;
-    case 'l': case 'L': state.viewMode = state.viewMode === 'list' ? 'lyrics' : 'list'; savePlayState(); state.dirty = true; break;
+    case 'l': case 'L': state.viewMode = state.viewMode === 'list' ? 'lyrics' : 'list'; savePlayState(true); state.dirty = true; break;
     case 'k': state.sel = Math.max(0, state.sel - 1); state.dirty = true; break;
     case 'n': playNext(1); break;
     case 'p': playNext(-1); break;
@@ -581,18 +623,21 @@ function tick() {
 function watchDirs() {
   const optsFs = { recursive: opts.recursive };
   try {
-    watcher = fs.watch(opts.dir, optsFs, () => { debounceRescan(); });
+    watcher = fs.watch(opts.dir, optsFs, (evt, filename) => {
+      // .lrc 交给下面的 lrcWatcher。歌词目录常常就放在曲库子目录里，不在这里滤掉的话，
+      // 每存一次歌词都要重扫整个曲库。filename 各平台不保证有，没有就照常重扫（安全兜底）。
+      if (filename && /\.lrc$/i.test(filename)) return;
+      debounceRescan();
+    });
     watcher.on('error', () => {});
   } catch {
     try { watcher = fs.watch(opts.dir, () => debounceRescan()); } catch { /* 不支持就不监视 */ }
   }
-  const watched = new Set();
   for (const d of lrcDirs) {
     try {
       lrcWatcher = fs.watch(d, { recursive: true }, () => { debounceLrc(); });
       lrcWatcher.on('error', () => {});
-      watched.add(d);
-      break; // 一个即可，避免句柄过多
+      break; // 只盯第一个能盯上的目录，避免句柄过多
     } catch { /* ignore */ }
   }
 }
@@ -615,7 +660,9 @@ function debounceLrc() {
   lrcTimer = setTimeout(() => {
     lrcTimer = null;
     rebuildLyricsIndex();
-    if (state.playing && !state.lrc) loadLyricsFor(state.playing);
+    // 无条件重读：正在听的那首歌，改完 .lrc 保存就该立刻看到新歌词，而不是等切歌。
+    // 旧逻辑只在「原本没有歌词」时才重读，改时间轴等于白改（界面一直是旧的那份）。
+    if (state.playing) loadLyricsFor(state.playing);
     say(`歌词库已更新：${state.lyricsIndex.length} 个`, 1500);
   }, 400);
 }
@@ -711,6 +758,8 @@ function mergeConfigIntoOpts(cfg) {
   if (!opts.volumeSet && Number.isFinite(cfg.volume)) opts.volume = cfg.volume;
   if (Number.isFinite(cfg.speed) && cfg.speed >= 0.25 && cfg.speed <= 4) state.speed = cfg.speed;
   if (cfg.viewMode === 'list' || cfg.viewMode === 'lyrics') state.viewMode = cfg.viewMode;
+  // 上次停在哪个分类就还回哪个（非字符串一律忽略，防止配置被手工改坏）
+  if (typeof cfg.dirFilter === 'string' && cfg.dirFilter) state.dirFilter = cfg.dirFilter;
 }
 
 // 目录：命令行 > 配置 > 在终端里问一句；问出来的存进配置
@@ -801,6 +850,9 @@ async function main() {
 
   createBackend();
   rebuildLyricsIndex();
+
+  // 自检/排版测试是工具，不是用户在用：别把伪造的播放进度写进用户的 config.json
+  if (opts.rendertest || opts.selftest) CFG.setPersist(false);
 
   if (opts.rendertest) { SELFTEST.rendertest(selftestCtx()); return; }
   if (opts.selftest) { SELFTEST.selftest(selftestCtx()); return; }

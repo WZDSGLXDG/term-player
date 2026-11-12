@@ -157,6 +157,41 @@ console.log('\n== 歌词匹配 ==');
   ok(lyrics.match(songC, idx) === null, '无关歌曲不误配');
 }
 
+console.log('\n== 刷新后光标位置 ==');
+{
+  // 曲库/歌词刷新会重建视图：光标必须跟着「那首歌」走，不能跳回正在播放的位置
+  const saved = P.state.playing;
+  P.rescan(false);
+  P.state.playing = P.state.view[0];
+  P.state.sel = P.state.view.length - 1;    // 翻到最后一首（离播放位置最远）
+  const target = P.state.view[P.state.sel].path;
+  // 伪造一次文件变化，逼 rescan 真走重建路径——否则会被「没变就跳过」提前返回，这条就成了空过
+  P.state.songs[0].size = -1;
+  P.rescan(true);                           // 模拟一次刷新
+  eq(P.state.view[P.state.sel].path, target, '刷新后光标留在原来那首（不跳回播放位置）');
+  eq(P.state.playing.path, P.state.view[0].path, '刷新不影响正在播放的那首');
+  P.state.playing = saved;
+}
+
+// 「没变就跳过」：改一个 .lrc 会连带触发 rescan，不该把整个库重建一遍
+{
+  P.rescan(false);
+  const ref = P.state.songs;
+  P.state.songs[0].meta = { title: '已经探测过' };
+  eq(P.rescan(true), false, '曲库没变 → rescan 返回 false');
+  ok(P.state.songs === ref, '曲库没变 → songs 数组没被重建');
+  eq((P.state.songs[0].meta || {}).title, '已经探测过', '曲库没变 → 已探测的元数据还在');
+}
+
+// 真的变了才值得重建
+{
+  P.rescan(false);
+  const before = P.state.songs;
+  P.state.songs[0].size = -1;
+  eq(P.rescan(true), true, '文件有变化 → rescan 返回 true');
+  ok(P.state.songs !== before, '文件有变化 → songs 被重建');
+}
+
 console.log('\n== 分类切换 ==');
 {
   P.state.dirFilter = null;
@@ -363,6 +398,12 @@ console.log('\n== 记忆播放进度 ==');
   eq(rec.speed, 1.5, '记住倍速');
   ok(rec.viewMode === P.state.viewMode, '记住当前视图（歌词/列表）');
 
+  // 分类也要记住：退出时在哪个文件夹，下次进来还是那个
+  eq(P.playStateRecord().dirFilter, null, '没选分类时记 null（= 全部）');
+  P.state.dirFilter = '示例分类';
+  eq(P.playStateRecord().dirFilter, '示例分类', '记住当前分类');
+  P.state.dirFilter = null;
+
   b.position = 1.2;
   eq(P.playStateRecord().last.position, 0, '开头 3 秒内记成 0');
   b.position = 197;
@@ -533,6 +574,56 @@ console.log('\n== 渲染宽度：84 列 ==');
 // 异步块（磁盘缓存要等 Promise）跑完再汇总
 (asyncChecks || Promise.resolve()).then(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
+  console.log('\n== 歌词索引增量重建 ==');
+  {
+    const tmpLrc = fs.mkdtempSync(path.join(os.tmpdir(), 'tp-lrc-inc-'));
+    const mk = (n, b) => fs.writeFileSync(path.join(tmpLrc, n), b, 'utf8');
+    mk('a.lrc', '[00:00.00]A\n');
+    mk('b.lrc', '[00:00.00]B\n');
+    mk('c.lrc', '[00:00.00]C\n');
+
+    lyrics.clearIndexCache();
+    let idx = lyrics.buildIndex([tmpLrc]);
+    let st = lyrics.buildStats();
+    eq(idx.length, 3, '首次建索引得到 3 个');
+    eq(st.parsed, 3, '首次全部要解析');
+    eq(st.reused, 0, '首次没有可复用的');
+
+    idx = lyrics.buildIndex([tmpLrc]);
+    st = lyrics.buildStats();
+    eq(idx.length, 3, '再跑一次还是 3 个');
+    eq(st.parsed, 0, '没改动 → 零解析（本次优化的核心）');
+    eq(st.reused, 3, '没改动 → 全部复用');
+
+    // 改一个：必须让 mtime 明确变化，否则按设计会当成没改
+    const t0 = Date.now();
+    while (Date.now() - t0 < 25) { /* 等 mtime 跨过一个时间片 */ }
+    mk('b.lrc', '[00:00.00]B改过\n[00:05.00]第二行\n');
+    idx = lyrics.buildIndex([tmpLrc]);
+    st = lyrics.buildStats();
+    eq(st.parsed, 1, '改 1 个 → 只解析那 1 个');
+    eq(st.reused, 2, '其余 2 个照旧复用');
+    const changed = idx.find((i) => i.stem === 'b');
+    eq(changed && changed.lineCount, 2, '改后的内容真的生效了');
+
+    // 删一个：索引和缓存都要跟着减
+    fs.unlinkSync(path.join(tmpLrc, 'c.lrc'));
+    idx = lyrics.buildIndex([tmpLrc]);
+    eq(idx.length, 2, '删掉一个后索引剩 2 个');
+    st = lyrics.buildStats();
+    eq(st.files, 2, '已删的文件不再出现在统计里');
+    eq(st.reused, 2, '剩下的全部复用');
+
+    // force：绕过缓存
+    idx = lyrics.buildIndex([tmpLrc], { force: true });
+    st = lyrics.buildStats();
+    eq(st.parsed, 2, 'force → 全部重新解析');
+    eq(st.reused, 0, 'force → 一个都不复用');
+
+    fs.rmSync(tmpLrc, { recursive: true, force: true });
+    lyrics.clearIndexCache();
+  }
+
   console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
   if (fail) { for (const f of failures) console.log('  - ' + f); process.exit(1); }
   process.exit(0);
